@@ -1,393 +1,422 @@
-# app.py
+#!/usr/bin/env python3
+"""
+Whitenet Telegram bot (text posts, likes, follows).
+Usage:
+  - Set env var TELEGRAM_BOT_TOKEN
+  - (Optional) Set DATABASE_URL (Postgres) otherwise sqlite file whitenet.db will be used.
+Run:
+  python bot.py
+"""
 import os
-import threading
-import time
-import requests
+import logging
 from datetime import datetime
-from urllib.parse import quote_plus
 
-from flask import Flask, request, jsonify
-from sqlalchemy import (create_engine, Column, Integer, String, Float,
-                        ForeignKey, DateTime)
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# -----------------------
-# Config (env vars)
-# -----------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# URL that Render exposes, e.g. "earthlife.onrender.com" (without https://)
-# used for setting webhook. If absent, user can call set_webhook with full URL.
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
-DATABASE_URL = os.getenv("DATABASE_URL")  # if not set, fallback to sqlite file
+from sqlalchemy import (
+    Column, Integer, String, Text, DateTime, ForeignKey, create_engine, func, UniqueConstraint
+)
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.exc import IntegrityError
 
+from dotenv import load_dotenv
+load_dotenv()
+
+# ---------- Config ----------
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Please set TELEGRAM_TOKEN environment variable")
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN env variable")
 
-# DB URL fallback: SQLite file for local testing
-if not DATABASE_URL:
-    DB_URL = "sqlite:///earth_life.db"
-else:
-    DB_URL = DATABASE_URL
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///whitenet.db")
+# ---------------------------
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # SQLAlchemy setup
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
+SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-# -----------------------
-# Models
-# -----------------------
-class Civilization(Base):
-    __tablename__ = "civilizations"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True, nullable=False)
-    men = Column(Integer, default=50)
-    women = Column(Integer, default=50)
-    base_birth_rate = Column(Float, default=3.0)  # percent per year
-    age = Column(Integer, default=0)
-    last_update = Column(DateTime, default=datetime.utcnow)
 
-    factors = relationship("Factor", back_populates="civ", cascade="all, delete-orphan")
+# ---------- Models ----------
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)  # Telegram user_id
+    username = Column(String(64), nullable=True)
+    display_name = Column(String(200), nullable=True)
+    bio = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-class Factor(Base):
-    __tablename__ = "factors"
-    id = Column(Integer, primary_key=True)
-    civ_id = Column(Integer, ForeignKey("civilizations.id"), nullable=False)
-    name = Column(String, nullable=False)
-    value = Column(Float, default=100.0)  # percent baseline 100.0
+    posts = relationship("Post", back_populates="author")
+    likes = relationship("Like", back_populates="user")
 
-    civ = relationship("Civilization", back_populates="factors")
 
-class Link(Base):
-    __tablename__ = "links"
-    id = Column(Integer, primary_key=True)
-    civ_id = Column(Integer, ForeignKey("civilizations.id"), nullable=False)
-    source_factor_id = Column(Integer, ForeignKey("factors.id"), nullable=False)
-    target_factor_id = Column(Integer, ForeignKey("factors.id"), nullable=False)
-    type = Column(String, nullable=False)  # 'inc' or 'dec'
-    magnitude = Column(Float, default=5.0)  # percent magnitude
+class Post(Base):
+    __tablename__ = "posts"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    likes_count = Column(Integer, default=0)
 
-# create tables
+    author = relationship("User", back_populates="posts")
+    likes = relationship("Like", back_populates="post")
+
+
+class Like(Base):
+    __tablename__ = "likes"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="likes")
+    post = relationship("Post", back_populates="likes")
+    __table_args__ = (UniqueConstraint("user_id", "post_id", name="_user_post_uc"),)
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False)   # who follows
+    target_id = Column(Integer, nullable=False) # who is followed
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "target_id", name="_user_target_uc"),)
+
+
+# Create tables
 Base.metadata.create_all(bind=engine)
 
-# -----------------------
-# App & helpers
-# -----------------------
-app = Flask(__name__)
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-def send_message(chat_id: int, text: str):
-    """Send message to telegram chat_id (simple wrapper)."""
-    try:
-        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-        return resp.ok
-    except Exception:
-        return False
-
-# -------- Core game logic (DB operations) --------
-def create_civilization(name: str):
-    session = SessionLocal()
-    try:
-        name = name[:64]
-        # check exists
-        existing = session.query(Civilization).filter_by(name=name).first()
-        if existing:
-            return False, "A civilization with that name already exists."
-        civ = Civilization(name=name, men=50, women=50, base_birth_rate=3.0, age=0)
-        session.add(civ)
-        session.commit()
-        # add Birth factor
-        birth = Factor(civ_id=civ.id, name="Birth", value=100.0)
-        session.add(birth)
-        session.commit()
-        return True, f"Civilization '{name}' created: 50 men, 50 women, Birth 100% (base birth rate 3%)."
-    finally:
-        session.close()
-
-def get_civ_by_name(name: str):
-    session = SessionLocal()
-    try:
-        return session.query(Civilization).filter_by(name=name).first()
-    finally:
-        session.close()
-
-def add_factor(civ_name: str, factor_name: str):
-    session = SessionLocal()
-    try:
-        civ = session.query(Civilization).filter_by(name=civ_name).first()
-        if not civ:
-            return False, "Civilization not found."
-        if session.query(Factor).filter_by(civ_id=civ.id, name=factor_name).first():
-            return False, "Factor already exists."
-        f = Factor(civ_id=civ.id, name=factor_name, value=100.0)
-        session.add(f)
-        session.commit()
-        return True, f"Factor '{factor_name}' added to civilization '{civ_name}'."
-    finally:
-        session.close()
-
-def link_factors(civ_name: str, source: str, typ: str, target: str, magnitude: float = 5.0):
-    session = SessionLocal()
-    try:
-        civ = session.query(Civilization).filter_by(name=civ_name).first()
-        if not civ:
-            return False, "Civilization not found."
-        src = session.query(Factor).filter_by(civ_id=civ.id, name=source).first()
-        tgt = session.query(Factor).filter_by(civ_id=civ.id, name=target).first()
-        if not src or not tgt:
-            return False, "Source or target factor not found."
-        if typ not in ("inc", "dec"):
-            return False, "type must be 'inc' or 'dec'."
-        link = Link(civ_id=civ.id, source_factor_id=src.id, target_factor_id=tgt.id, type=typ, magnitude=float(magnitude))
-        session.add(link)
-        session.commit()
-        return True, f"Linked: {source} ({typ}) -> {target} (mag={magnitude}%)"
-    finally:
-        session.close()
-
-def list_factors(civ_name: str):
-    session = SessionLocal()
-    try:
-        civ = session.query(Civilization).filter_by(name=civ_name).first()
-        if not civ:
-            return None
-        rows = session.query(Factor).filter_by(civ_id=civ.id).all()
-        return [(f.name, f.value) for f in rows]
-    finally:
-        session.close()
-
-def list_links(civ_name: str):
-    session = SessionLocal()
-    try:
-        civ = session.query(Civilization).filter_by(name=civ_name).first()
-        if not civ:
-            return None
-        rows = session.query(Link).filter_by(civ_id=civ.id).all()
-        res = []
-        for l in rows:
-            sess2 = SessionLocal()
-            src = sess2.query(Factor).filter_by(id=l.source_factor_id).first()
-            tgt = sess2.query(Factor).filter_by(id=l.target_factor_id).first()
-            sess2.close()
-            res.append((src.name if src else "?", l.type, tgt.name if tgt else "?", l.magnitude))
-        return res
-    finally:
-        session.close()
-
-# Influence algorithm
-def apply_influences_to_civ(session, civ: Civilization):
-    # load factor dict
-    facts = {f.id: {"name": f.name, "value": f.value} for f in civ.factors}
-    deltas = {fid: 0.0 for fid in facts.keys()}
-    links = session.query(Link).filter_by(civ_id=civ.id).all()
-    for l in links:
-        if l.source_factor_id not in facts or l.target_factor_id not in facts:
-            continue
-        src_val = facts[l.source_factor_id]["value"]
-        # influence proportional to deviation from baseline (100)
-        delta = (src_val - 100.0) * (l.magnitude / 100.0)
-        if l.type == "dec":
-            delta = -delta
-        deltas[l.target_factor_id] += delta
-    # apply deltas
-    for fid, delta in deltas.items():
-        new_val = facts[fid]["value"] + delta
-        if new_val < 0.0: new_val = 0.0
-        if new_val > 1000.0: new_val = 1000.0
-        session.query(Factor).filter_by(id=fid).update({"value": new_val})
-    session.commit()
-
-def apply_tick_to_civ(civ_name: str):
-    session = SessionLocal()
-    try:
-        civ = session.query(Civilization).filter_by(name=civ_name).first()
-        if not civ:
-            return False, "Civilization not found."
-        # 1) apply influences which can modify factor values
-        apply_influences_to_civ(session, civ)
-        # load Birth factor
-        birth = session.query(Factor).filter_by(civ_id=civ.id, name="Birth").first()
-        birth_val = birth.value if birth else 100.0
-        effective_birth_rate = civ.base_birth_rate * (birth_val / 100.0)
-        total = civ.men + civ.women
-        new_people = total * (effective_birth_rate / 100.0)
-        # mortality after 30 years
-        if civ.age >= 30:
-            mortality_rate = (civ.age - 30) * 0.1  # percent
-            new_people -= total * (mortality_rate / 100.0)
-        new_people_int = max(int(round(new_people)), 0)
-        new_men = new_people_int // 2
-        new_women = new_people_int - new_men
-        civ.men += new_men
-        civ.women += new_women
-        civ.age += 1
-        civ.last_update = datetime.utcnow()
-        session.commit()
-        return True, {
-            "name": civ.name,
-            "age": civ.age,
-            "men": civ.men,
-            "women": civ.women,
-            "effective_birth_rate": round(effective_birth_rate, 6),
-            "new_people": new_people_int
-        }
-    finally:
-        session.close()
-
-def tick_all():
-    session = SessionLocal()
-    try:
-        civs = session.query(Civilization).all()
-        results = {}
-        for civ in civs:
-            ok, res = apply_tick_to_civ(civ.name)
-            results[civ.name] = res if ok else None
-        return results
-    finally:
-        session.close()
-
-# ---------- Background ticker ----------
-def background_ticker_loop():
-    # 3 hours = 10800 seconds
-    wait_seconds = 3 * 60 * 60
-    while True:
+# ---------- Helpers ----------
+def get_or_create_user(session, tg_user: types.User):
+    user = session.query(User).get(tg_user.id)
+    if not user:
+        user = User(
+            id=tg_user.id,
+            username=tg_user.username,
+            display_name=(tg_user.full_name if hasattr(tg_user, "full_name") else tg_user.username)
+        )
+        session.add(user)
         try:
-            print(f"[Ticker] Applying tick to all civilizations at {datetime.utcnow().isoformat()} ...")
-            res = tick_all()
-            print("[Ticker] Tick completed:", res)
-        except Exception as e:
-            print("[Ticker] Error:", e)
-        time.sleep(wait_seconds)
+            session.commit()
+        except Exception:
+            session.rollback()
+            user = session.query(User).get(tg_user.id)
+    else:
+        # update username/display name if changed
+        updated = False
+        if user.username != tg_user.username:
+            user.username = tg_user.username
+            updated = True
+        full_name = tg_user.full_name if hasattr(tg_user, "full_name") else tg_user.username
+        if user.display_name != full_name:
+            user.display_name = full_name
+            updated = True
+        if updated:
+            session.add(user)
+            session.commit()
+    return user
 
-# Start background thread when running
-def start_background_thread():
-    t = threading.Thread(target=background_ticker_loop, daemon=True)
-    t.start()
 
-# ---------- Webhook endpoint ----------
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    # Telegram will POST updates here
-    data = request.get_json(force=True)
-    # handle message simple parser
-    msg = data.get("message") or data.get("edited_message")
-    if not msg:
-        return jsonify({"ok": True})
-    chat = msg.get("chat", {})
-    chat_id = chat.get("id")
-    text = msg.get("text", "")
+def build_post_keyboard(post_id: int, author_id: int, session):
+    kb = InlineKeyboardMarkup(row_width=3)
+    # Like button shows current count
+    post = session.query(Post).get(post_id)
+    likes = post.likes_count if post else 0
+    kb.insert(InlineKeyboardButton(text=f"❤️ {likes}", callback_data=f"like:{post_id}"))
+    kb.insert(InlineKeyboardButton(text="Профиль автора", callback_data=f"profile:{author_id}"))
+    kb.insert(InlineKeyboardButton(text="Подписаться", callback_data=f"follow:{author_id}"))
+    return kb
+
+
+# ---------- Bot setup ----------
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(bot)
+
+
+# ---------- Handlers ----------
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    session = SessionLocal()
+    user = get_or_create_user(session, message.from_user)
+    await message.answer(
+        "Привет! Это Whitenet — простой текстовый социальный бот.\n\n"
+        "Команды:\n"
+        "/post <текст> — создать пост\n"
+        "/feed — лента (последние посты)\n"
+        "/my_posts — мои посты\n"
+        "/profile — показать профиль\n"
+        "/setbio <текст> — установить bio\n"
+        "/follow <user_id> — подписаться (по id)\n"
+        "/unfollow <user_id> — отписаться\n"
+        "/help — помощь"
+    )
+    session.close()
+
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    await cmd_start(message)
+
+
+@dp.message_handler(commands=["setbio"])
+async def cmd_setbio(message: types.Message):
+    text = message.get_args()
     if not text:
-        send_message(chat_id, "Я принимаю только текстовые команды.")
-        return jsonify({"ok": True})
-    # parse command
-    parts = text.strip().split()
-    cmd = parts[0].lower()
-    args = parts[1:]
+        await message.reply("Использование: /setbio Текст вашего bio")
+        return
+    session = SessionLocal()
+    user = get_or_create_user(session, message.from_user)
+    user.bio = text[:1000]
+    session.add(user)
+    session.commit()
+    await message.reply("Bio обновлён.")
+    session.close()
+
+
+@dp.message_handler(commands=["profile"])
+async def cmd_profile(message: types.Message):
+    session = SessionLocal()
+    # If user specified id: /profile <id>
+    args = message.get_args().strip()
+    if args:
+        try:
+            uid = int(args)
+        except:
+            await message.reply("Неправильный id пользователя.")
+            session.close()
+            return
+        user = session.query(User).get(uid)
+        if not user:
+            await message.reply("Пользователь не найден.")
+            session.close()
+            return
+    else:
+        user = get_or_create_user(session, message.from_user)
+
+    posts_count = session.query(func.count(Post.id)).filter(Post.user_id == user.id).scalar()
+    followers = session.query(func.count(Subscription.id)).filter(Subscription.target_id == user.id).scalar()
+    following = session.query(func.count(Subscription.id)).filter(Subscription.user_id == user.id).scalar()
+
+    text = (
+        f"👤 {user.display_name} (@{user.username})\n"
+        f"📝 Постов: {posts_count}\n"
+        f"👥 Подписчики: {followers}\n"
+        f"➡️ Подписки: {following}\n"
+        f"💬 Bio: {user.bio or '—'}\n"
+        f"ID: {user.id}"
+    )
+    await message.reply(text)
+    session.close()
+
+
+@dp.message_handler(commands=["post"])
+async def cmd_post(message: types.Message):
+    text = message.get_args().strip()
+    if not text:
+        await message.reply("Использование: /post ТЕКСТ. Пример: /post Привет, это мой первый пост!")
+        return
+    session = SessionLocal()
+    user = get_or_create_user(session, message.from_user)
+    post = Post(user_id=user.id, text=text[:2000])
+    session.add(post)
+    session.commit()
+    await message.reply("Пост опубликован!", reply_markup=build_post_keyboard(post.id, user.id, session))
+    session.close()
+
+
+@dp.message_handler(commands=["my_posts"])
+async def cmd_my_posts(message: types.Message):
+    session = SessionLocal()
+    user = get_or_create_user(session, message.from_user)
+    posts = session.query(Post).filter(Post.user_id == user.id).order_by(Post.created_at.desc()).limit(10).all()
+    if not posts:
+        await message.reply("У вас ещё нет постов. Создайте первым: /post ТЕКСТ")
+        session.close()
+        return
+    for p in posts:
+        kb = build_post_keyboard(p.id, p.user_id, session)
+        created = p.created_at.strftime("%Y-%m-%d %H:%M")
+        await message.answer(f"{p.text}\n\n🕒 {created}", reply_markup=kb)
+    session.close()
+
+
+@dp.message_handler(commands=["feed"])
+async def cmd_feed(message: types.Message):
+    session = SessionLocal()
+    # personalized feed: posts from people user follows; if none -> recent global
+    user = get_or_create_user(session, message.from_user)
+    follows = session.query(Subscription.target_id).filter(Subscription.user_id == user.id).all()
+    follow_ids = [f[0] for f in follows]
+    if follow_ids:
+        posts = session.query(Post).filter(Post.user_id.in_(follow_ids)).order_by(Post.created_at.desc()).limit(20).all()
+    else:
+        posts = session.query(Post).order_by(Post.created_at.desc()).limit(20).all()
+
+    if not posts:
+        await message.reply("Лента пуста — пока нет постов. Попросите друзей написать /post")
+        session.close()
+        return
+
+    for p in posts:
+        author = session.query(User).get(p.user_id)
+        kb = build_post_keyboard(p.id, p.user_id, session)
+        created = p.created_at.strftime("%Y-%m-%d %H:%M")
+        head = f"👤 {author.display_name} (@{author.username})\n"
+        await message.answer(f"{head}{p.text}\n\n🕒 {created}", reply_markup=kb)
+    session.close()
+
+
+@dp.message_handler(commands=["follow"])
+async def cmd_follow(message: types.Message):
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("Использование: /follow <user_id>")
+        return
     try:
-        if cmd == "/start":
-            send_message(chat_id, "Привет! Earth Life — создайте цивилизацию: /create <имя>")
-        elif cmd == "/create":
-            if not args:
-                send_message(chat_id, "Использование: /create <имя_цивилизации>")
-            else:
-                name = " ".join(args)[:64]
-                ok, msg = create_civilization(name)
-                send_message(chat_id, msg)
-        elif cmd == "/status":
-            if not args:
-                send_message(chat_id, "Использование: /status <имя_цивилизации>")
-            else:
-                name = " ".join(args)[:64]
-                session = SessionLocal()
-                civ = session.query(Civilization).filter_by(name=name).first()
-                if not civ:
-                    send_message(chat_id, "Цивилизация не найдена.")
-                else:
-                    factors = session.query(Factor).filter_by(civ_id=civ.id).all()
-                    lines = [
-                        f"🌍 {civ.name}",
-                        f"Возраст: {civ.age} лет",
-                        f"Мужчин: {civ.men}",
-                        f"Женщин: {civ.women}",
-                        f"Базовая рождаемость: {civ.base_birth_rate}%",
-                        "Факторы:"
-                    ]
-                    for f in factors:
-                        lines.append(f" - {f.name}: {round(f.value,3)}%")
-                    links = list_links(name)
-                    if links:
-                        lines.append("Связи:")
-                        for l in links:
-                            arrow = "↑" if l[1] == "inc" else "↓"
-                            lines.append(f" - {l[0]} {arrow} {l[2]} (mag={l[3]}%)")
-                    send_message(chat_id, "\n".join(lines))
+        target_id = int(args)
+    except:
+        await message.reply("Неверный user_id.")
+        return
+    session = SessionLocal()
+    user = get_or_create_user(session, message.from_user)
+    if user.id == target_id:
+        await message.reply("Нельзя подписаться на самого себя.")
+        session.close()
+        return
+    # check target exists
+    target = session.query(User).get(target_id)
+    if not target:
+        await message.reply("Пользователь с таким id не найден.")
+        session.close()
+        return
+    sub = Subscription(user_id=user.id, target_id=target_id)
+    session.add(sub)
+    try:
+        session.commit()
+        await message.reply(f"Вы подписаны на {target.display_name}.")
+    except IntegrityError:
+        session.rollback()
+        await message.reply("Вы уже подписаны.")
+    session.close()
+
+
+@dp.message_handler(commands=["unfollow"])
+async def cmd_unfollow(message: types.Message):
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("Использование: /unfollow <user_id>")
+        return
+    try:
+        target_id = int(args)
+    except:
+        await message.reply("Неверный user_id.")
+        return
+    session = SessionLocal()
+    user = get_or_create_user(session, message.from_user)
+    deleted = session.query(Subscription).filter(Subscription.user_id == user.id, Subscription.target_id == target_id).delete()
+    session.commit()
+    if deleted:
+        await message.reply("Отписались.")
+    else:
+        await message.reply("Вы не были подписаны.")
+    session.close()
+
+
+# Callback handler for inline buttons (like/profile/follow)
+@dp.callback_query_handler(lambda c: c.data)
+async def process_callback(callback_query: types.CallbackQuery):
+    data = callback_query.data
+    session = SessionLocal()
+    try:
+        if data.startswith("like:"):
+            post_id = int(data.split(":", 1)[1])
+            user = get_or_create_user(session, callback_query.from_user)
+            # attempt to create like
+            like = Like(user_id=user.id, post_id=post_id)
+            session.add(like)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                await callback_query.answer("Вы уже ставили лайк этому посту.", show_alert=False)
                 session.close()
-        elif cmd == "/addfactor":
-            if len(args) < 2:
-                send_message(chat_id, "Использование: /addfactor <имя_цивилизации> <название_фактора>")
+                return
+            # increment counter
+            post = session.query(Post).get(post_id)
+            if post:
+                post.likes_count = (post.likes_count or 0) + 1
+                session.add(post)
+                session.commit()
+            await callback_query.answer("Понравилось! ❤️", show_alert=False)
+            # edit message keyboard to update like count (best-effort)
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=callback_query.message.chat.id,
+                    message_id=callback_query.message.message_id,
+                    reply_markup=build_post_keyboard(post_id, post.user_id, session)
+                )
+            except Exception:
+                pass
+
+        elif data.startswith("profile:"):
+            target_id = int(data.split(":", 1)[1])
+            target = session.query(User).get(target_id)
+            if not target:
+                await callback_query.answer("Пользователь не найден.", show_alert=True)
             else:
-                civ_name = args[0]
-                factor_name = " ".join(args[1:])[:64]
-                ok, msg = add_factor(civ_name, factor_name)
-                send_message(chat_id, msg)
-        elif cmd == "/link":
-            # /link <civ> <source> <inc|dec> <target> [magnitude]
-            if len(args) < 4:
-                send_message(chat_id, "Использование: /link <civ> <source> <inc|dec> <target> [magnitude]")
-            else:
-                civ_name = args[0]
-                source = args[1]
-                typ = args[2]
-                target = args[3]
-                mag = float(args[4]) if len(args) >= 5 else 5.0
-                ok, msg = link_factors(civ_name, source, typ, target, mag)
-                send_message(chat_id, msg)
-        elif cmd == "/tick":
-            if not args:
-                send_message(chat_id, "Использование: /tick <имя_цивилизации>")
-            else:
-                name = " ".join(args)[:64]
-                ok, res = apply_tick_to_civ(name)
-                if not ok:
-                    send_message(chat_id, res)
-                else:
-                    send_message(chat_id, f"Прошёл 1 год для '{res['name']}'. Возраст: {res['age']} лет. Мужчин: {res['men']}. Женщин: {res['women']}. Новых людей: {res['new_people']}. Эфф. рождаемость: {res['effective_birth_rate']}%")
-        elif cmd == "/help":
-            send_message(chat_id, "/create <name>\n/status <name>\n/addfactor <civ> <factor>\n/link <civ> <src> <inc|dec> <tgt> [mag]\n/tick <name>\n/help")
+                posts_count = session.query(func.count(Post.id)).filter(Post.user_id == target.id).scalar()
+                followers = session.query(func.count(Subscription.id)).filter(Subscription.target_id == target.id).scalar()
+                following = session.query(func.count(Subscription.id)).filter(Subscription.user_id == target.id).scalar()
+                text = (
+                    f"👤 {target.display_name} (@{target.username})\n"
+                    f"📝 Постов: {posts_count}\n"
+                    f"👥 Подписчики: {followers}\n"
+                    f"➡️ Подписки: {following}\n"
+                    f"💬 Bio: {target.bio or '—'}\n"
+                    f"ID: {target.id}"
+                )
+                await bot.send_message(callback_query.from_user.id, text)
+                await callback_query.answer()
+        elif data.startswith("follow:"):
+            target_id = int(data.split(":", 1)[1])
+            user = get_or_create_user(session, callback_query.from_user)
+            if user.id == target_id:
+                await callback_query.answer("Нельзя подписаться на себя.", show_alert=True)
+                session.close()
+                return
+            sub = Subscription(user_id=user.id, target_id=target_id)
+            session.add(sub)
+            try:
+                session.commit()
+                await callback_query.answer("Подписка оформлена.")
+            except IntegrityError:
+                session.rollback()
+                await callback_query.answer("Вы уже подписаны.")
         else:
-            send_message(chat_id, "Неизвестная команда. /help")
-    except Exception as e:
-        send_message(chat_id, f"Ошибка: {e}")
-    return jsonify({"ok": True})
+            await callback_query.answer()
+    finally:
+        session.close()
 
-# ---------- set_webhook route ----------
-@app.route("/set_webhook", methods=["GET"])
-def set_webhook():
-    # You can call this once after deploy (or use Render dashboard cron)
-    if RENDER_EXTERNAL_URL:
-        url = f"https://{RENDER_EXTERNAL_URL}/webhook/{TELEGRAM_TOKEN}"
-    else:
-        # user must provide full URL as ?url=...
-        q = request.args.get("url")
-        if not q:
-            return "Provide ?url=https://yourdomain/webhook/<TOKEN> or set RENDER_EXTERNAL_URL env var", 400
-        url = q
-    resp = requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": url})
-    if resp.ok:
-        return f"Webhook set to {url}: {resp.text}"
-    else:
-        return f"Failed to set webhook: {resp.status_code} {resp.text}", 500
 
-# ---------- health check ----------
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
+@dp.message_handler()
+async def fallback(message: types.Message):
+    # Friendly fallback: if user sends text without /post maybe it's intended as a post?
+    # We do nothing automatically; show quick help
+    await message.reply("Неизвестная команда. Используйте /help. Чтобы создать пост — /post ТЕКСТ")
 
-# ---------- start background thread on startup ----------
-start_background_thread()
 
-# ---------- Run (gunicorn recommended in production) ----------
+# ---------- Entry point ----------
 if __name__ == "__main__":
-    # For local debugging only
-    start_background_thread()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    logger.info("Starting Whitenet bot (polling mode)")
+    # Start long polling
+    executor.start_polling(dp, skip_updates=True)
