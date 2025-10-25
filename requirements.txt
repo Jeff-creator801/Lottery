@@ -1,5 +1,4 @@
-Flask>=2.0
-SQLAlchemy>=1.4
-requests>=2.28
-psycopg2-binary>=2.9  # only used if you use PostgreSQL via DATABASE_URL
-gunicorn>=20.1
+aiogram==2.25.1
+SQLAlchemy==1.4.55
+psycopg2-binary==2.9.7
+python-dotenv==1.0.0
